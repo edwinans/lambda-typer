@@ -49,8 +49,7 @@ let new_var () : string =
 
 exception UnboundValue
 
-let rec gen_equas (env : (string * ltype) list) (t : lterm) (target : ltype) :
-    equa =
+let rec gen_equas (env : (string * ltype) list) (t : lterm) (target : ltype) : equa =
   match t with
   | Var x -> (
     try
