@@ -15,14 +15,11 @@ type pterm =
   | Let of string * pterm * pterm
   | Let_Rec of string * pterm * pterm
 
-let t = Let ("a", Int 5, Add (Int 4, Var "a"))
+type vartype = Unknown of string | Instance of ptype
 
-type ptype =
-  | TVar of string
-  | Arr of ptype * ptype
-  | N
-  | TList of ptype
-  | Forall of string list * ptype
+and ptype = TVar of vartype ref | Arr of ptype * ptype | N | TList of ptype
+
+and forall = Forall of string list * ptype
 
 type equa = (ptype * ptype) list
 
@@ -82,16 +79,16 @@ and pretty_printer term =
 
 and print_type t =
   match t with
-  | TVar x ->
+  | TVar {contents= Unknown x} ->
       x
+  | TVar {contents= Instance t} ->
+      print_type t
   | Arr (m, n) ->
       "(" ^ print_type m ^ " -> " ^ print_type n ^ ")"
   | N ->
       "int"
   | TList a ->
       print_type a ^ " list"
-  | Forall (l, p) ->
-      "Forall " ^ "l" ^ "." ^ print_type p
 
 let var_counter : int ref = ref 0
 
@@ -99,20 +96,24 @@ let new_var () : string =
   var_counter := !var_counter + 1 ;
   "T" ^ string_of_int !var_counter
 
+let new_unknown () = TVar (ref (Unknown (new_var ())))
+
 (* return all type variables of t*)
 let get_vars t =
   let rec aux t acc =
     match t with
-    | TVar v ->
-        if List.mem v acc then acc else v :: acc
+    | TVar v -> (
+      match !v with
+      | Unknown n ->
+          if List.mem n acc then acc else n :: acc
+      | Instance t ->
+          aux t acc )
     | Arr (t1, t2) ->
         let acc = aux t1 acc in
         aux t2 acc
     | N ->
         acc
     | TList t1 ->
-        aux t1 acc
-    | Forall (_, t1) ->
         aux t1 acc
   in
   aux t []
@@ -124,7 +125,7 @@ let rec remove_all l1 l2 =
   | x :: xs ->
       if List.mem x l2 then remove_all xs l2 else x :: remove_all xs l2
 
-let get_free_vars_env (env : (string * ptype) list) : string list =
+let get_free_vars_env (env : (string * forall) list) : string list =
   let rec aux env acc =
     match env with
     | [] ->
@@ -134,155 +135,149 @@ let get_free_vars_env (env : (string * ptype) list) : string list =
       | Forall (var, t1) ->
           let vars = get_vars t1 in
           let free_vars = remove_all vars var in
-          aux xs (free_vars :: acc)
-      | Arr (t1, t2) ->
-          aux xs (get_vars t1 :: get_vars t2 :: acc)
-      | N ->
-          aux xs acc
-      | TVar var ->
-          aux xs ([var] :: acc)
-      | TList t1 ->
-          aux xs (get_vars t1 :: acc) )
+          aux xs (free_vars :: acc) )
   in
   aux env []
 
 let get_eq_target eq target =
   match eq with t1, t2 -> if target = t1 then t2 else t1
 
-let rec generalise env t =
+let type_instance st =
+  match st with
+  | Forall (gv, t) ->
+      let unknowns = List.map (function n -> (n, new_unknown ())) gv in
+      let rec instance = function
+        | TVar {contents= Unknown n} as t -> (
+          try List.assoc n unknowns with Not_found -> t )
+        | TVar {contents= Instance t} ->
+            instance t
+        | N ->
+            N
+        | TList t ->
+            TList (instance t)
+        | Arr (t1, t2) ->
+            Arr (instance t1, instance t2)
+      in
+      instance t
+
+let rec generalise (env : (string * forall) list) (t : ptype) : forall =
   let free_vars = get_free_vars_env env in
   let vars = List.filter (fun v -> not (List.mem v free_vars)) (get_vars t) in
-  if vars = [] then t else Forall (vars, t)
+  Forall (vars, t)
 
-let rec gen_equas (env : (string * ptype) list) (expr : pterm) (target : ptype)
-    : equa =
-  match expr with
-  | Var x -> (
-    try
-      let r = List.assoc x env in
-      [(target, r)]
-    with Not_found -> raise (Type_error (Unbound_var x)) )
-  | Abs (x, m) ->
-      let t1 = new_var () and t2 = new_var () in
-      let arr = Arr (TVar t1, TVar t2) in
-      (target, arr) :: gen_equas ((x, TVar t1) :: env) m (TVar t2)
-  | App (f, x) ->
-      let t1 = new_var () in
-      gen_equas env f (Arr (TVar t1, target)) @ gen_equas env x (TVar t1)
-  | Add (e1, e2) ->
-      ((N, target) :: gen_equas env e1 N) @ gen_equas env e2 N
-  | Sub (e1, e2) ->
-      ((N, target) :: gen_equas env e1 N) @ gen_equas env e2 N
-  | List Empty ->
-      []
-  | List (Cons (x, xs)) ->
-      let var = new_var () in
-      ((TList (TVar var), target) :: gen_equas env x (TVar var))
-      @ gen_equas env (List xs) (TList (TVar var))
-  | Hd (List l) ->
-      let var = new_var () in
-      [(Forall ([var], Arr (TList (TVar var), TVar var)), target)]
-  | Tail (List _) ->
-      let var = new_var () in
-      [(Forall ([var], Arr (TList (TVar var), TList (TVar var))), target)]
-  | Int _ ->
-      [(N, target)]
-  | If_Zero (c, e1, e2) ->
-      gen_equas env c N @ gen_equas env e1 target @ gen_equas env e2 target
-  | If_Empty (c, e1, e2) ->
-      let var = new_var () in
-      gen_equas env c (Forall ([var], TVar var))
-      @ gen_equas env e1 target @ gen_equas env e2 target
-  | Let (v, e1, e2) ->
-      let t0 = typer e1 in
-      let t0_g = generalise env t0 in
-      gen_equas ((v, t0_g) :: env) e2 target
-  | Let_Rec (v, e1, e2) ->
-      let t0 = typer e1 in
-      let t0_g = generalise env t0 in
-      gen_equas ((v, t0_g) :: env) e2 target
-  | _ ->
-      failwith "equation exception"
+let occurs n t = List.mem n (get_vars t)
 
-and occur_check v = function
-  | TVar x ->
-      x = v
-  | Arr (t1, t2) ->
-      occur_check v t1 || occur_check v t2
-  | TList t1 ->
-      occur_check v t1
-  | N ->
-      false
-  | Forall (_, t1) ->
-      occur_check v t1
-
-and substitue_type v ts t =
-  match t with
-  | TVar x ->
-      if x = v then ts else t
-  | Arr (t1, t2) ->
-      Arr (substitue_type v ts t1, substitue_type v ts t2)
-  | N ->
-      N
-  | TList t1 ->
-      TList (substitue_type v ts t1)
-  | Forall (vars, t1) ->
-      Forall (vars, substitue_type v ts t1)
-
-and substitue_partout (v : string) (ts : ptype) (eqs : equa) : equa =
-  match eqs with
-  | [] ->
-      []
-  | (t1, t2) :: xs ->
-      (substitue_type v ts t1, substitue_type v ts t2)
-      :: substitue_partout v ts xs
-
-and substitue_type_vars (vars : string list) t =
-  match vars with
-  | [] ->
+let rec shorten = function
+  | TVar vt as tt -> (
+    match !vt with
+    | Unknown _ ->
+        tt
+    | Instance (TVar _ as t) ->
+        let t2 = shorten t in
+        vt := Instance t ;
+        t2
+    | Instance t ->
+        t )
+  | t ->
       t
-  | x :: xs ->
-      let var = new_var () in
-      substitue_type_vars xs (substitue_type x (TVar var) t)
 
-and unification_etape eqs target =
-  match eqs with
-  | [] ->
-      []
-  | (Forall (vars, t1), t2) :: xs ->
-      (substitue_type_vars vars t1, t2) :: xs
-  | (t1, Forall (vars, t2)) :: xs ->
-      (substitue_type_vars vars t2, t1) :: xs
-  | (TList t1, TList t2) :: xs ->
-      (t1, t2) :: xs
-  | (t1, t2) :: xs when t1 = target || t2 = target ->
-      unification_etape (xs @ [(t1, t2)]) target
-  | (t1, t2) :: xs when t1 = t2 ->
-      xs
-  | (TVar x, t2) :: xs ->
-      if not (occur_check x t2) then substitue_partout x t2 xs
-      else failwith "error unification_etape"
-  | (Arr (t1, t2), Arr (t3, t4)) :: xs ->
-      (t1, t3) :: (t2, t4) :: xs
+let rec unify_types (t1, t2) =
+  let lt1 = shorten t1 and lt2 = shorten t2 in
+  match (lt1, lt2) with
+  | TVar ({contents= Unknown n} as occn), TVar {contents= Unknown m} ->
+      if n = m then () else occn := Instance lt2
+  | TVar ({contents= Unknown n} as occn), _ ->
+      if occurs n lt2 then raise (Type_error (Clash (lt1, lt2)))
+      else occn := Instance lt2
+  | _, TVar {contents= Unknown n} ->
+      unify_types (lt2, lt1)
+  | N, N ->
+      ()
+  | TList t1, TList t2 ->
+      unify_types (t1, t2)
+  | Arr (t1, t2), Arr (t3, t4) ->
+      unify_types (t1, t3) ;
+      unify_types (t2, t4)
   | _ ->
-      failwith "error unification_etape"
+      raise (Type_error (Clash (lt1, lt2)))
 
-and unification eqs timeout target =
-  if timeout <= 0 then failwith "timeout"
-  else
-    match eqs with
-    | [] ->
-        failwith "error unification"
-    | [x] ->
-        x
-    | x ->
-        unification (unification_etape x target) (timeout - 1) target
+let alpha = TVar (ref (Unknown "alpha"))
 
-and typer (term : pterm) =
-  let target = TVar (new_var ()) in
-  let eqs = gen_equas [] term target in
-  let unif_res = unification eqs 10000 target in
-  get_eq_target unif_res target
+and beta = TVar (ref (Unknown "beta"))
+
+let rec type_expr gamma =
+  let rec type_rec expri =
+    match expri with
+    | Int n ->
+        N
+    | Var s ->
+        let t =
+          try List.assoc s gamma
+          with Not_found -> raise (Type_error (Unbound_var s))
+        in
+        type_instance t
+    | Hd l ->
+        let l_type = Forall (["alpha"], Arr (TList alpha, alpha)) in
+        let t1 = type_instance l_type
+        and t2 = type_rec l
+        and u = new_unknown () in
+        unify_types (t1, Arr (t2, u)) ;
+        u
+    | Tail l ->
+        let l_type = Forall (["alpha"], Arr (TList alpha, TList alpha)) in
+        let t1 = type_instance l_type and t2 = type_rec l in
+        let u = new_unknown () in
+        unify_types (t1, Arr (t2, u)) ;
+        u
+    | Add (e1, e2) ->
+        let t = Arr (N, Arr (N, N)) and t1 = type_rec e1 and t2 = type_rec e2 in
+        unify_types (t1, N) ;
+        unify_types (t2, N) ;
+        N
+    | Sub (e1, e2) ->
+        let t = Arr (N, Arr (N, N)) and t1 = type_rec e1 and t2 = type_rec e2 in
+        unify_types (t1, N) ;
+        unify_types (t2, N) ;
+        N
+    | List Empty ->
+        TList (new_unknown ())
+    | List (Cons (e1, e2)) ->
+        let t1 = type_rec e1 and t2 = type_rec (List e2) in
+        unify_types (TList t1, t2) ;
+        t2
+    | If_Zero (e1, e2, e3) ->
+        let t1 = type_rec e1 and t2 = type_rec e2 and t3 = type_rec e3 in
+        unify_types (t1, N) ;
+        unify_types (t2, t3) ;
+        t2
+    | If_Empty (e1, e2, e3) ->
+        let target = Forall (["alpha"], TList alpha) in
+        let t1 = type_rec e1 and t2 = type_rec e2 and t3 = type_rec e3 in
+        let u1 = type_instance target in
+        unify_types (t1, u1) ;
+        unify_types (t2, t3) ;
+        t2
+    | App (e1, e2) ->
+        let t1 = type_rec e1 and t2 = type_rec e2 in
+        let u = new_unknown () in
+        unify_types (t1, Arr (t2, u)) ;
+        u
+    | Abs (s, e) ->
+        let t = new_unknown () in
+        let new_env = (s, Forall ([], t)) :: gamma in
+        Arr (t, type_expr new_env e)
+    | Let (s, e1, e2) ->
+        let t1 = type_rec e1 in
+        let tg = generalise gamma t1 in
+        type_expr ((s, tg) :: gamma) e2
+    | Let_Rec (s, e1, e2) ->
+        let u = new_unknown () in
+        let new_env = (s, Forall ([], u)) :: gamma in
+        let t1 = type_expr (new_env @ gamma) e1 in
+        let tg = generalise new_env t1 in
+        type_expr ((s, tg) :: gamma) e2
+  in
+  type_rec
 
 let main () =
   print_endline
