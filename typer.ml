@@ -14,10 +14,20 @@ type pterm =
   | If_Zero of pterm * pterm * pterm
   | Let of string * pterm * pterm
   | Let_Rec of string * pterm * pterm
+  | Ref of pterm
+  | Unref of pterm
+  | Assign of pterm * pterm
+  | Unit
 
 type vartype = Unknown of string | Instance of ptype
 
-and ptype = TVar of vartype ref | Arr of ptype * ptype | N | TList of ptype
+and ptype =
+  | TVar of vartype ref
+  | Arr of ptype * ptype
+  | N
+  | TList of ptype
+  | TUnit
+  | TRef of ptype
 
 and forall = Forall of string list * ptype
 
@@ -80,6 +90,14 @@ and pretty_printer term =
       "let " ^ x ^ " = " ^ pretty_printer e1 ^ " in " ^ pretty_printer e2
   | Let_Rec (x, e1, e2) ->
       "let rec " ^ x ^ " = " ^ pretty_printer e1 ^ " in " ^ pretty_printer e2
+  | Ref x ->
+      "ref " ^ pretty_printer x
+  | Unref x ->
+      "! " ^ pretty_printer x
+  | Assign (x, y) ->
+      pretty_printer x ^ " := " ^ pretty_printer y
+  | Unit ->
+      "()"
 
 and print_type t =
   match t with
@@ -93,6 +111,10 @@ and print_type t =
       "int"
   | TList a ->
       print_type a ^ " list"
+  | TRef t ->
+      print_type t ^ " ref"
+  | TUnit ->
+      "unit"
 
 let var_counter : int ref = ref 0
 
@@ -119,6 +141,10 @@ let get_vars t =
         acc
     | TList t1 ->
         aux t1 acc
+    | TRef t ->
+        aux t acc
+    | TUnit ->
+        acc
   in
   aux t []
 
@@ -143,9 +169,6 @@ let get_free_vars_env (env : (string * forall) list) : string list =
   in
   aux env []
 
-let get_eq_target eq target =
-  match eq with t1, t2 -> if target = t1 then t2 else t1
-
 let type_instance st =
   match st with
   | Forall (gv, t) ->
@@ -161,6 +184,10 @@ let type_instance st =
             TList (instance t)
         | Arr (t1, t2) ->
             Arr (instance t1, instance t2)
+        | TRef t ->
+            instance t
+        | TUnit ->
+            TUnit
       in
       instance t
 
@@ -202,6 +229,10 @@ let rec unify_types (t1, t2) =
   | Arr (t1, t2), Arr (t3, t4) ->
       unify_types (t1, t3) ;
       unify_types (t2, t4)
+  | TUnit, TUnit ->
+      ()
+  | TRef t1, TRef t2 ->
+      failwith "fail to unify ref"
   | _ ->
       raise (Type_error (Clash (lt1, lt2)))
 
@@ -221,12 +252,14 @@ let rec type_expr gamma =
         let t1 = type_instance l_type
         and t2 = type_rec l
         and u = new_unknown () in
-        unify_types (t1, Arr (t2, u)); u
+        unify_types (t1, Arr (t2, u)) ;
+        u
     | Tail l ->
         let l_type = Forall (["alpha"], Arr (TList alpha, TList alpha)) in
         let t1 = type_instance l_type and t2 = type_rec l in
         let u = new_unknown () in
-        unify_types (t1, Arr (t2, u)) ; u
+        unify_types (t1, Arr (t2, u)) ;
+        u
     | Add (e1, e2) ->
         let t = Arr (N, Arr (N, N)) and t1 = type_rec e1 and t2 = type_rec e2 in
         unify_types (t1, N) ;
@@ -274,16 +307,31 @@ let rec type_expr gamma =
         let t1 = type_expr (new_env @ gamma) e1 in
         let tg = generalise new_env t1 in
         type_expr ((s, tg) :: gamma) e2
+    | Ref e ->
+        let t = type_rec e in
+        TRef t
+    | Unref e -> 
+        (match type_rec e with
+            | TRef t -> t 
+            | _ -> failwith "unable to unref")
+    | Assign (e1, e2) ->
+        let target = Forall (["alpha"], TRef alpha) in
+        let t0 = type_instance target
+        and t1 = type_rec e1
+        and t2 = type_rec e2 in
+        unify_types (t1, t0) ;
+        unify_types (t2, alpha) ;
+        TUnit
+    | Unit ->
+        TUnit
   in
   type_rec
 
-let type_checker = 
-  type_expr []
+let type_checker = type_expr []
 
 let main () =
-begin
   let l = Tail (List (Cons (Int 3, Cons (Int 4, Empty)))) in
-  print_endline
-    (pretty_printer l);
-  type_checker l
-end
+  let l_ref = Ref l in
+  print_endline (pretty_printer l) ;
+  print_endline (print_type (type_checker l_ref));
+  type_checker (Unref l_ref)
